@@ -1,0 +1,102 @@
+---
+name: CI
+
+# Build, test and cache cargo-release per system, so consumers substitute it
+# instead of compiling. PR builds push to the cache too (same-repo branches
+# only; forks have no secret).
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-14
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: pr0d1r2
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: >-
+            ${{ github.event_name == 'pull_request'
+            && github.event.pull_request.head.repo.full_name != github.repository }}
+          # Upload only what this repo produced, not the nixpkgs closure.
+          pushFilter: '(-source$|nixpkgs\.tar\.gz$)'
+
+      - name: Build cargo-release
+        run: nix build --print-build-logs .#packages.${{ matrix.system }}.default
+
+      - name: Flake check (this system)
+        run: nix flake check --print-build-logs
+
+  # x86_64-darwin must evaluate but is never built: GitHub's only Intel macOS
+  # runner is being retired.
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Eval every declared system
+        run: |
+          for s in x86_64-linux aarch64-linux aarch64-darwin x86_64-darwin; do
+            nix eval --raw ".#packages.$s.default.drvPath"; echo
+          done
+
+  # Our nixpkgs must be the exact rev nixpkgs-lock publishes, or consumers on
+  # the fleet pin miss the cache.
+  assert-pins:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: nixpkgs rev matches nixpkgs-lock
+        run: |
+          set -euo pipefail
+          ours="$(nix flake metadata --json | jq -r '.locks.nodes.nixpkgs.locked.rev')"
+          theirs="$(nix flake metadata --json github:pr0d1r2/nixpkgs-lock \
+            | jq -r '.locks.nodes.nixpkgs.locked.rev')"
+          echo "ours=$ours theirs=$theirs"
+          if [ "$ours" != "$theirs" ]; then
+            echo "::error::nixpkgs rev drift: $ours != $theirs; run nix flake update nixpkgs-lock" >&2
+            exit 1
+          fi
